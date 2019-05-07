@@ -61,6 +61,18 @@ void div_kernel(TensorIterator& iter) {
   }
 }
 
+void batch_norm_kernel(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(), "add_cpu", [&]() {
+    ternary_kernel_vec(iter,
+      [=](scalar_t a, scalar_t b, scalar_t c) -> scalar_t { return a * b + c; },
+      [=](Vec256<scalar_t> a, Vec256<scalar_t> b, Vec256<scalar_t> c) {
+        //return a * b + c;
+        return vec256::fmadd(a, b, c);
+      });
+  });
+}
+
+
 } // anonymous namespace
 
 
@@ -68,5 +80,6 @@ REGISTER_DISPATCH(add_stub, &add_kernel);
 REGISTER_DISPATCH(sub_stub, &sub_kernel);
 REGISTER_DISPATCH(mul_stub, &mul_kernel);
 REGISTER_DISPATCH(div_stub, &div_kernel);
+REGISTER_DISPATCH(batch_norm_stub, &batch_norm_kernel);
 
 }} // namespace at::native

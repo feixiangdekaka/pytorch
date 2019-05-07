@@ -9,6 +9,10 @@
 
 #include <vector>
 
+#include <ATen/Dispatch.h>
+#include <ATen/native/BinaryOps.h>
+#include <ATen/native/TensorIterator.h>
+
 static const int MIOPEN_DIM_MAX = 4;
 
 namespace at { namespace native {
@@ -125,6 +129,44 @@ void batch_norm_cpu_inference_contiguous(Tensor& output, const Tensor& input,
   }
 }
 
+
+DEFINE_DISPATCH(batch_norm_stub);
+
+template<typename scalar_t>
+void batch_norm_cpu_inference_2(Tensor& output, const Tensor& input,
+    const Tensor& weight /* optional */, const Tensor& bias /* optional */,
+    const Tensor& mean, const Tensor& variance, double eps) {
+
+  Tensor alpha = at::empty_like(mean);
+  Tensor beta = at::empty_like(mean);
+  scalar_t* alpha_data = alpha.data<scalar_t>();
+  scalar_t* beta_data = beta.data<scalar_t>();
+  const scalar_t* weight_data = weight.defined() ? weight.data<scalar_t>() : nullptr;
+  const scalar_t* bias_data = bias.defined() ? bias.data<scalar_t>() : nullptr;
+  const scalar_t* mean_data = mean.data<scalar_t>();
+  const scalar_t* var_data = variance.data<scalar_t>();
+  int64_t n_channel = input.size(1);
+  // TODO maybe use TensorIterator here, or at least use the strides
+  for (int64_t c = 0; c < n_channel; c++) {
+    scalar_t inv_var = 1 / std::sqrt(var_data[c] + static_cast<scalar_t>(eps));
+    scalar_t weight_v = weight_data ? weight_data[c] : 1;
+    scalar_t bias_v = bias_data ? bias_data[c] : 0;
+    alpha_data[c] = inv_var * weight_v;
+    beta_data[c] = bias_v - mean_data[c] * inv_var * weight_v;
+  }
+
+  auto builder = TensorIterator::Builder();
+  builder.add_output(output);
+  builder.add_input(input);
+  builder.add_input(alpha.reshape({1, -1, 1, 1}));
+  builder.add_input(beta.reshape({1, -1, 1, 1}));
+  //builder.add_input(weight.reshape({1, -1, 1, 1}));
+  //builder.add_input(bias.reshape({1, -1, 1, 1}));
+  auto iter = builder.build();
+
+  batch_norm_stub(iter->device_type(), *iter);
+}
+
 template<typename scalar_t>
 std::tuple<Tensor,Tensor,Tensor> batch_norm_cpu_transform_input_template(
     const Tensor& input, const Tensor& weight, const Tensor& bias,
@@ -134,12 +176,21 @@ std::tuple<Tensor,Tensor,Tensor> batch_norm_cpu_transform_input_template(
 
   Tensor output = at::empty_like(input);
 
+  // FIXME nasty hack to easily have both kernels available
+  if (!train && eps > 1) {
+    //std::cout << "Here\n";
+    batch_norm_cpu_inference_2<scalar_t>(output, input, weight, bias,
+      running_mean, running_var, eps);
+    return std::make_tuple(output, save_mean, save_invstd);
+  }
+
   // Check if we should use the fast path.
   if (!train && input.is_contiguous()
       && (!weight.defined() || weight.is_contiguous())
       && (!bias.defined() || bias.is_contiguous())
       && running_mean.is_contiguous()
       && running_var.is_contiguous()) {
+    //std::cout << "There\n";
     batch_norm_cpu_inference_contiguous<scalar_t>(output, input, weight, bias,
       running_mean, running_var, eps);
     return std::make_tuple(output, save_mean, save_invstd);

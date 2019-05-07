@@ -11,6 +11,15 @@ using namespace vec256;
 
 // all three operands contiguous
 template <typename traits>
+static inline bool is_ternary_contiguous(const int64_t* strides) {
+  return strides[0] == sizeof(typename traits::result_type) &&
+         strides[1] == sizeof(typename traits::arg1_t) &&
+         strides[2] == sizeof(typename traits::arg2_t) &&
+         strides[3] == sizeof(typename traits::arg3_t);
+}
+
+// all three operands contiguous
+template <typename traits>
 static inline bool is_binary_contiguous(const int64_t* strides) {
   return strides[0] == sizeof(typename traits::result_type) &&
          strides[1] == sizeof(typename traits::arg1_t) &&
@@ -92,6 +101,32 @@ static inline bool is_reduction(char** data, const int64_t* strides) {
   char* out_ptr = data[0]; \
   const char* in1_ptr = data[1]; \
   const char* in2_ptr = data[2];
+
+
+#define TERNARY_LOOP_HEADER(func_t, data, strides) \
+  using traits = ternary_function_traits<func_t>; \
+  using arg0_t = typename traits::result_type; \
+  using arg1_t = typename traits::arg1_t; \
+  using arg2_t = typename traits::arg2_t; \
+  using arg3_t = typename traits::arg3_t; \
+  char* out_ptr = data[0]; \
+  const char* in1_ptr = data[1]; \
+  const char* in2_ptr = data[2]; \
+  const char* in3_ptr = data[3]; \
+  int64_t s0 = strides[0], s1 = strides[1], s2 = strides[2], s3 = strides[3];
+
+#define TERNARY_VEC_HEADER(func_t) \
+  using traits = ternary_function_traits<func_t>; \
+  using scalar_t = typename traits::result_type; \
+  using Vec = Vec256<scalar_t>;
+
+#define TERNARY_VEC_LOOP_HEADER(func_t, data) \
+  TERNARY_VEC_HEADER(func_t) \
+  char* out_ptr = data[0]; \
+  const char* in1_ptr = data[1]; \
+  const char* in2_ptr = data[2]; \
+  const char* in3_ptr = data[3];
+
 
 // Basic loop unary operation (one input, one output). May be auto-vectorized
 // by the compiler.
@@ -343,5 +378,66 @@ void binary_kernel_vec(TensorIterator& iter, func_t op, vec_func_t vop) {
     }
   });
 }
+
+// Basic loop ternary operation (two inputs, one output). May be auto-vectorized
+// by the compiler.
+template <typename func_t>
+static inline void ternary_loop(char** data, const int64_t* strides, int64_t i, int64_t n, func_t op) {
+  TERNARY_LOOP_HEADER(func_t, data, strides)
+  for (; i < n; i++) {
+    arg1_t in1 = *(arg1_t*)(in1_ptr + i * s1);
+    arg2_t in2 = *(arg2_t*)(in2_ptr + i * s2);
+    arg3_t in3 = *(arg3_t*)(in3_ptr + i * s3);
+    arg0_t out = op(in1, in2, in3);
+    *(arg0_t*)(out_ptr + i * s0) = out;
+  }
+}
+
+// computes out = op(in1, in2)
+template <typename func_t, typename vec_func_t>
+static inline void vectorized_ternary_loop(char** data, int64_t n, func_t op, vec_func_t vop) {
+  TERNARY_VEC_LOOP_HEADER(func_t, data)
+  int64_t i = 0;
+  for (; i <= n - 2 * Vec::size(); i += 2 * Vec::size()) {
+    auto a1 = Vec::loadu(in1_ptr + i * sizeof(scalar_t));
+    auto a2 = Vec::loadu(in1_ptr + (i + Vec::size()) * sizeof(scalar_t));
+    auto b1 = Vec::loadu(in2_ptr + i * sizeof(scalar_t));
+    auto b2 = Vec::loadu(in2_ptr + (i + Vec::size()) * sizeof(scalar_t));
+    auto c1 = Vec::loadu(in3_ptr + i * sizeof(scalar_t));
+    auto c2 = Vec::loadu(in3_ptr + (i + Vec::size()) * sizeof(scalar_t));
+    auto out1 = vop(a1, b1, c1);
+    auto out2 = vop(a2, b2, c2);
+    out1.store(out_ptr + i * sizeof(scalar_t));
+    out2.store(out_ptr + (i + Vec::size()) * sizeof(scalar_t));
+  }
+  int64_t strides[] = { sizeof(scalar_t), sizeof(scalar_t), sizeof(scalar_t), sizeof(scalar_t) };
+  ternary_loop(data, strides, i, n, op);
+}
+
+
+template <typename func_t, typename vec_func_t>
+void ternary_kernel_vec(TensorIterator& iter, func_t op, vec_func_t vop) {
+  using traits = ternary_function_traits<func_t>;
+  static_assert(
+    std::is_same<typename traits::result_type, typename traits::arg1_t>::value,
+    "all types must match");
+  static_assert(
+    std::is_same<typename traits::result_type, typename traits::arg2_t>::value,
+    "all types must match");
+
+  iter.for_each([&](int ntensor, char** data, const int64_t* strides, int64_t n) {
+    if (is_ternary_contiguous<traits>(strides)) {
+      vectorized_ternary_loop(data, n, op, vop);
+    //} else if (is_ternary_contiguous_s1<traits>(strides)) {
+    //  vectorized_ternary_loop_s1(data, n, op, vop);
+    //} else if (is_ternary_contiguous_s2<traits>(strides)) {
+    //  vectorized_ternary_loop_s2(data, n, op, vop);
+    } else {
+      ternary_loop(data, strides, 0, n, op);
+    }
+  });
+}
+
+
 
 }}}  // namespace at::native::<anonymous>
